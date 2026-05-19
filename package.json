@@ -11,6 +11,7 @@
     "discord.js": "^14.26.4",
     "dotenv": "^17.4.2",
     "imapflow": "^1.2.0",
-    "mailparser": "^3.9.0"
+    "mailparser": "^3.9.0",
+    "ioredis": "^5.3.2"
   }
 }

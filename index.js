@@ -63,6 +63,22 @@ let escrowImapPollingTimer = null;
 const escrowMailboxStateMap = new Map();
 const escrowButtonCooldownMap = new Map(); // userId -> lastPressedAt
 
+let redisClient = null;
+
+if (process.env.REDIS_URL) {
+    try {
+        const IORedis = require('ioredis');
+        redisClient = new IORedis(process.env.REDIS_URL);
+
+        redisClient.on('error', err => {
+            console.error('Redis error:', err);
+        });
+    } catch (e) {
+        console.warn('ioredis 패키지 로드 실패, Redis 미사용:', e && e.message);
+        redisClient = null;
+    }
+}
+
 async function loadEscrowConfig() {
     try {
         const raw = await fs.readFile(ESCROW_CONFIG_FILE, 'utf8');
@@ -78,6 +94,22 @@ async function loadEscrowConfig() {
 
 async function loadEscrowCodes() {
     try {
+        if (redisClient) {
+            const raw = await redisClient.get('escrow:codes');
+
+            if (!raw) return;
+
+            const parsed = JSON.parse(raw);
+
+            escrowCodeMap.clear();
+
+            for (const [userId, entry] of Object.entries(parsed)) {
+                escrowCodeMap.set(userId, entry);
+            }
+
+            return;
+        }
+
         const raw = await fs.readFile(ESCROW_CODES_FILE, 'utf8');
         const parsed = JSON.parse(raw);
 
@@ -94,6 +126,12 @@ async function loadEscrowCodes() {
 async function saveEscrowCodes() {
     try {
         const serialized = JSON.stringify(Object.fromEntries(escrowCodeMap.entries()), null, 2);
+
+        if (redisClient) {
+            await redisClient.set('escrow:codes', serialized);
+            return;
+        }
+
         await fs.writeFile(ESCROW_CODES_FILE, serialized, 'utf8');
     } catch (error) {
         console.error('escrow codes save 실패:', error);
