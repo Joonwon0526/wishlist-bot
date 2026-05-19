@@ -120,15 +120,28 @@ async function ensureEscrowChannel(guild, channelName, reason, overwrites = []) 
     return channel;
 }
 
-function buildEscrowLogContent(senderLabel, code, hasInputPhrase) {
+function buildEscrowLogContent(senderLabel, code, hasInputPhrase, member) {
 
-    return [
+    const lines = [
         '## 신용인 인증 완료',
         `- 발신자: ${senderLabel}`,
         `- 인증코드: ${code}`,
-        `- 입력문구 포함: ${hasInputPhrase ? '예' : '아니오'}`,
-        `- 처리 시각: <t:${Math.floor(Date.now() / 1000)}:F>`
-    ].join('\n');
+        `- 입력문구 포함: ${hasInputPhrase ? '예' : '아니오'}`
+    ];
+
+    if (member) {
+        try {
+            const userTag = member.user?.tag ?? `${member.user?.username ?? 'Unknown'}#?`;
+            const userId = member.id ?? (member.user?.id ?? '알 수 없음');
+            lines.push(`- 디스코드: <@${userId}> (${userTag}, ${userId})`);
+        } catch {
+            // ignore member formatting errors
+        }
+    }
+
+    lines.push(`- 처리 시각: <t:${Math.floor(Date.now() / 1000)}:F>`);
+
+    return lines.join('\n');
 }
 
 function getEscrowRecipientEmail(guildId) {
@@ -175,6 +188,12 @@ function getMailSenderLabel(parsed) {
     if (parsed.from?.text) return parsed.from.text;
 
     return '알 수 없음';
+}
+
+function isPhoneNumberSender(senderAddress) {
+    // 전화번호 형식 발신자 확인: 010으로 시작하는 번호만 허락 (01023181764@mms.kt.co.kr 형태)
+    // 패턴: 010 + 7~8자리 숫자 @ 도메인
+    return /^010\d{7,8}@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(senderAddress);
 }
 
 function findEscrowEntryByCode(code) {
@@ -232,8 +251,9 @@ async function processEscrowMailMessage(rawMessage) {
     const code = extractSixDigitCode(searchableText);
     const hasInputPhrase = searchableText.includes('입력되었습니다');
     const senderLabel = getMailSenderLabel(parsed);
+    const senderAddress = (parsed.from?.value?.[0]?.address ?? '').toLowerCase();
 
-    console.log('인증 메일 확인:', { senderLabel, hasInputPhrase, hasCode: Boolean(code) });
+    console.log('인증 메일 확인:', { senderLabel, hasInputPhrase, hasCode: Boolean(code), senderAddress });
 
     if (!code) return;
 
@@ -249,6 +269,32 @@ async function processEscrowMailMessage(rawMessage) {
 
     if (!member) return;
 
+    // 전화번호 형식 발신자만 인증 처리
+    if (!isPhoneNumberSender(senderAddress)) {
+        console.log('아이디 형식 발신자, 거절:', senderAddress);
+
+        // 사용자에게 SMS로 보내달라고 알림 (1분 후 삭제)
+        try {
+            const notifyChannel = await client.channels.fetch(TARGET_ESCROW_CHANNEL_ID).catch(() => null);
+
+            if (notifyChannel?.isTextBased?.()) {
+                const tempMsg = await notifyChannel.send({ content: `<@${member.id}>님 SMS 문자로 보내주세요.` });
+
+                setTimeout(async () => {
+                    try {
+                        await tempMsg.delete().catch(() => null);
+                    } catch (e) {
+                        // ignore
+                    }
+                }, 60 * 1000);
+            }
+        } catch (e) {
+            console.error('거절 알림 전송 실패:', e);
+        }
+
+        return;
+    }
+
     const roleObj = await ensureEscrowVerifiedRole(guild);
 
     await member.roles.add(roleObj.id).catch(error => {
@@ -259,7 +305,7 @@ async function processEscrowMailMessage(rawMessage) {
     escrowCodeMap.delete(pending.userId);
 
     const completionMessage = `${hasInputPhrase ? '완료되었습니다\n' : ''}인증이 완료되었습니다.`;
-    const notificationMessage = buildEscrowLogContent(senderLabel, code, hasInputPhrase);
+    const notificationMessage = buildEscrowLogContent(senderLabel, code, hasInputPhrase, member);
     const guildConfig = pending.guildId ? getGuildConfig(pending.guildId) : null;
     const notificationChannelId = guildConfig?.escrowLogChannelId ?? ESCROW_DEFAULT_SUCCESS_CHANNEL_ID;
     const notificationChannel = await client.channels.fetch(notificationChannelId).catch(() => null);
@@ -277,6 +323,25 @@ async function processEscrowMailMessage(rawMessage) {
                 console.error('대체 채널 전송 실패:', error);
             });
         }
+    }
+
+    // 요청: 고정 채널(TARGET_ESCROW_CHANNEL_ID)에 짧은 알림을 보낸 뒤 1분 후 삭제
+    try {
+        const notifyChannel = await client.channels.fetch(TARGET_ESCROW_CHANNEL_ID).catch(() => null);
+
+        if (notifyChannel?.isTextBased?.()) {
+            const tempMsg = await notifyChannel.send({ content: `<@${member.id}> 인증되었습니다` });
+
+            setTimeout(async () => {
+                try {
+                    await tempMsg.delete().catch(() => null);
+                } catch (e) {
+                    // ignore
+                }
+            }, 60 * 1000);
+        }
+    } catch (e) {
+        console.error('인증 알림 전송 실패:', e);
     }
 
     if (pending.channelId && notificationChannel?.id !== pending.channelId) {
@@ -1747,6 +1812,25 @@ client.on(Events.InteractionCreate, async interaction => {
             }
 
             if (stored.code !== provided) {
+                // 코드 오류 시 알림 메시지 (1분 후 삭제)
+                try {
+                    const errorChannel = await client.channels.fetch(TARGET_ESCROW_CHANNEL_ID).catch(() => null);
+
+                    if (errorChannel?.isTextBased?.()) {
+                        const tempMsg = await errorChannel.send({ content: `<@${interaction.user.id}> 잘못입력했습니다` });
+
+                        setTimeout(async () => {
+                            try {
+                                await tempMsg.delete().catch(() => null);
+                            } catch (e) {
+                                // ignore
+                            }
+                        }, 60 * 1000);
+                    }
+                } catch (e) {
+                    console.error('오류 알림 전송 실패:', e);
+                }
+
                 await interaction.editReply({ content: '인증 코드가 일치하지 않습니다.' });
                 return;
             }
