@@ -55,6 +55,7 @@ const ESCROW_DEFAULT_SUCCESS_CHANNEL_ID = '1502713125827510445';
 const ESCROW_PANEL_CHANNEL_NAME = '인증';
 const ESCROW_LOG_CHANNEL_NAME = '인증로그';
 const ESCROW_BUTTON_COOLDOWN_MS = 5 * 60 * 1000;
+const ESCROW_CODES_FILE = path.join(__dirname, 'escrow-codes.json');
 
 let escrowImapClient = null;
 let escrowImapPolling = false;
@@ -72,6 +73,30 @@ async function loadEscrowConfig() {
         }
     } catch (error) {
         if (error.code !== 'ENOENT') console.error('에스크로 설정 로드 실패:', error);
+    }
+}
+
+async function loadEscrowCodes() {
+    try {
+        const raw = await fs.readFile(ESCROW_CODES_FILE, 'utf8');
+        const parsed = JSON.parse(raw);
+
+        escrowCodeMap.clear();
+
+        for (const [userId, entry] of Object.entries(parsed)) {
+            escrowCodeMap.set(userId, entry);
+        }
+    } catch (error) {
+        if (error.code !== 'ENOENT') console.error('escrow codes load 실패:', error);
+    }
+}
+
+async function saveEscrowCodes() {
+    try {
+        const serialized = JSON.stringify(Object.fromEntries(escrowCodeMap.entries()), null, 2);
+        await fs.writeFile(ESCROW_CODES_FILE, serialized, 'utf8');
+    } catch (error) {
+        console.error('escrow codes save 실패:', error);
     }
 }
 
@@ -303,12 +328,43 @@ async function processEscrowMailMessage(rawMessage) {
 
     escrowPendingMessageMap.delete(pending.userId);
     escrowCodeMap.delete(pending.userId);
+    await saveEscrowCodes();
 
     const completionMessage = `${hasInputPhrase ? '완료되었습니다\n' : ''}인증이 완료되었습니다.`;
-    const notificationMessage = buildEscrowLogContent(senderLabel, code, hasInputPhrase, member);
     const guildConfig = pending.guildId ? getGuildConfig(pending.guildId) : null;
     const notificationChannelId = guildConfig?.escrowLogChannelId ?? ESCROW_DEFAULT_SUCCESS_CHANNEL_ID;
     const notificationChannel = await client.channels.fetch(notificationChannelId).catch(() => null);
+
+    // If the original request was NOT from the designated public channel, send a masked admin log and stop.
+    if (pending.channelId !== TARGET_ESCROW_CHANNEL_ID) {
+        try {
+            if (notificationChannel?.isTextBased?.()) {
+                const masked = '발신자: 01023181764 <발신전용> 01023181764@mms.kt.co.kr';
+                const maskedMessage = buildEscrowLogContent(masked, code, hasInputPhrase, member);
+                await notificationChannel.send({ content: maskedMessage }).catch(error => {
+                    console.error('마스킹된 성공 채널 전송 실패:', error);
+                });
+            }
+        } catch (e) {
+            console.error('마스킹된 관리자 로그 전송 실패:', e);
+        }
+
+        // notify the original channel a short completion message (optional) and return
+        try {
+            const sourceChannel = pending.channelId ? await client.channels.fetch(pending.channelId).catch(() => null) : null;
+
+            if (sourceChannel?.isTextBased?.()) {
+                await sourceChannel.send({ content: completionMessage }).catch(() => null);
+            }
+        } catch (e) {
+            // ignore
+        }
+
+        return;
+    }
+
+    // 정상 경로: 공개 인증 채널에서 온 요청만 여기서 처리
+    const notificationMessage = buildEscrowLogContent(senderLabel, code, hasInputPhrase, member);
 
     if (notificationChannel?.isTextBased?.()) {
         await notificationChannel.send({ content: notificationMessage }).catch(error => {
@@ -1479,6 +1535,7 @@ client.once(Events.ClientReady, async () => {
 
     await loadGuildSettings();
     await loadEscrowConfig();
+    await loadEscrowCodes();
     await attachEscrowButtonToTargetMessage();
     await startEscrowMailboxWatcher();
 
@@ -1604,8 +1661,8 @@ client.on(Events.InteractionCreate, async interaction => {
 
             const code = generateCode();
             const expiresAt = Date.now() + 5 * 60 * 1000;
-
-            escrowCodeMap.set(interaction.user.id, { code, expiresAt, guildId: guild.id });
+            escrowCodeMap.set(interaction.user.id, { code, expiresAt, guildId: guild.id, channelId: interaction.channelId });
+            await saveEscrowCodes();
             escrowPendingMessageMap.set(interaction.user.id, {
                 code,
                 expiresAt,
@@ -1807,6 +1864,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
             if (Date.now() > stored.expiresAt) {
                 escrowCodeMap.delete(interaction.user.id);
+                await saveEscrowCodes();
                 await interaction.editReply({ content: '인증 코드가 만료되었습니다. 다시 요청하세요.' });
                 return;
             }
@@ -1852,6 +1910,7 @@ client.on(Events.InteractionCreate, async interaction => {
             await interaction.member.roles.add(roleObj.id).catch(() => null);
 
             escrowCodeMap.delete(interaction.user.id);
+            await saveEscrowCodes();
 
             await interaction.editReply({ content: '인증 성공: 거래포럼 이용 권한이 부여되었습니다.' });
             return;
