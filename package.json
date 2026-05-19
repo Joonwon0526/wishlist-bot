@@ -1,0 +1,16 @@
+{
+  "name": "wishlist-bot",
+  "version": "1.0.0",
+  "description": "Discord wishlist and escrow helper bot",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.26.4",
+    "dotenv": "^17.4.2",
+    "imapflow": "^1.2.0",
+    "mailparser": "^3.9.0"
+  }
+}
