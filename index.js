@@ -35,6 +35,7 @@ const ESCROW_CONFIG_FILE = path.join(__dirname, 'escrow-config.json');
 const escrowConfigMap = new Map();
 const escrowCodeMap = new Map(); // userId -> { code, expiresAt, guildId }
 const escrowPendingMessageMap = new Map(); // userId -> { code, expiresAt, guildId, channelId }
+const escrowSmsNoticeStateMap = new Map(); // userId -> { code, notifiedAt }
 const DEFAULT_ESCROW_EMAIL = 'hwanzixwan@gmail.com';
 const DEFAULT_ESCROW_PANEL_IMAGE_1 = path.join(__dirname, 'assets', 'escrow-panel-1.svg');
 const DEFAULT_ESCROW_PANEL_IMAGE_2 = path.join(__dirname, 'assets', 'escrow-panel-2.svg');
@@ -44,7 +45,7 @@ const ESCROW_PANEL_IMAGE_SOURCES = [
 ].filter(Boolean);
 const ESCROW_IMAP_HOST = 'imap.gmail.com';
 const ESCROW_IMAP_PORT = 993;
-const ESCROW_POLL_INTERVAL_MS = 15000;
+const ESCROW_POLL_INTERVAL_MS = 5000;
 const ESCROW_MAILBOX_CANDIDATES = [
     'INBOX',
     '[Gmail]/Spam',
@@ -55,13 +56,19 @@ const ESCROW_DEFAULT_SUCCESS_CHANNEL_ID = '1502713125827510445';
 const ESCROW_PANEL_CHANNEL_NAME = '인증';
 const ESCROW_LOG_CHANNEL_NAME = '인증로그';
 const ESCROW_BUTTON_COOLDOWN_MS = 5 * 60 * 1000;
+const ESCROW_TEMP_MESSAGE_TTL_MS = 30 * 1000;
+const ESCROW_NOTICE_SWEEP_INTERVAL_MS = 60 * 1000;
+const ESCROW_SMS_NOTICE_COOLDOWN_MS = 10 * 60 * 1000;
+const ESCROW_PROCESSED_MAIL_TTL_MS = 30 * 60 * 1000;
 const ESCROW_CODES_FILE = path.join(__dirname, 'escrow-codes.json');
 
 let escrowImapClient = null;
 let escrowImapPolling = false;
 let escrowImapPollingTimer = null;
+let escrowNoticeSweeperTimer = null;
 const escrowMailboxStateMap = new Map();
 const escrowButtonCooldownMap = new Map(); // userId -> lastPressedAt
+const escrowProcessedMailMap = new Map(); // messageKey -> processedAt
 
 let redisClient = null;
 
@@ -183,6 +190,39 @@ async function ensureEscrowChannel(guild, channelName, reason, overwrites = []) 
     return channel;
 }
 
+async function resolveEscrowLogChannel(guild) {
+
+    const guildConfig = getGuildConfig(guild.id);
+    const configuredChannelId = guildConfig?.escrowLogChannelId ?? null;
+    const configuredChannel = configuredChannelId
+        ? await client.channels.fetch(configuredChannelId).catch(() => null)
+        : null;
+
+    if (configuredChannel?.isTextBased?.() && configuredChannel.guild?.id === guild.id) {
+        return configuredChannel;
+    }
+
+    const createdChannel = await ensureEscrowChannel(
+        guild,
+        ESCROW_LOG_CHANNEL_NAME,
+        '인증로그 자동 세팅 채널 생성',
+        [
+            {
+                id: guild.roles.everyone.id,
+                deny: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages]
+            }
+        ]
+    );
+
+    guildSettingsMap.set(guild.id, {
+        ...guildConfig,
+        escrowLogChannelId: createdChannel.id
+    });
+    await saveGuildSettings();
+
+    return createdChannel;
+}
+
 function buildEscrowLogContent(senderLabel, code, hasInputPhrase, member) {
 
     const lines = [
@@ -259,6 +299,144 @@ function isPhoneNumberSender(senderAddress) {
     return /^010\d{7,8}@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(senderAddress);
 }
 
+function cleanupProcessedMailMap(now = Date.now()) {
+
+    for (const [messageKey, processedAt] of escrowProcessedMailMap.entries()) {
+        if (now - processedAt > ESCROW_PROCESSED_MAIL_TTL_MS) {
+            escrowProcessedMailMap.delete(messageKey);
+        }
+    }
+}
+
+function markMailAsProcessed(messageKey, now = Date.now()) {
+
+    cleanupProcessedMailMap(now);
+
+    if (escrowProcessedMailMap.has(messageKey)) {
+        return false;
+    }
+
+    escrowProcessedMailMap.set(messageKey, now);
+    return true;
+}
+
+function shouldSendEscrowSmsNotice(userId, code, now = Date.now()) {
+
+    const state = escrowSmsNoticeStateMap.get(userId);
+
+    if (state && state.code === code && (now - state.notifiedAt) < ESCROW_SMS_NOTICE_COOLDOWN_MS) {
+        return false;
+    }
+
+    escrowSmsNoticeStateMap.set(userId, { code, notifiedAt: now });
+    return true;
+}
+
+function isEscrowTemporaryNoticeContent(content) {
+
+    const text = String(content ?? '');
+    return text.includes('인증이 완료되었습니다.') ||
+    text.includes('인증 되었습니다.') ||
+    text.includes('인증되었습니다.') ||
+        text.includes('SMS 문자로 보내주세요.') ||
+        text.includes('인증코드가 일치하지 않습니다.');
+}
+
+function isEscrowTemporaryNoticeMessage(message) {
+
+    if (!message) return false;
+    if (!client.user || message.author?.id !== client.user.id) return false;
+
+    return isEscrowTemporaryNoticeContent(message.content);
+}
+
+async function cleanupEscrowTemporaryNoticesInChannel(channel, olderThanMs = ESCROW_TEMP_MESSAGE_TTL_MS) {
+
+    if (!channel?.isTextBased?.() || !channel.messages?.fetch) return;
+
+    const now = Date.now();
+    const recentMessages = await channel.messages.fetch({ limit: 50 }).catch(() => null);
+
+    if (!recentMessages) return;
+
+    for (const message of recentMessages.values()) {
+        if (!isEscrowTemporaryNoticeMessage(message)) continue;
+        if ((now - message.createdTimestamp) < olderThanMs) continue;
+
+        await message.delete().catch(() => null);
+    }
+}
+
+async function sendEscrowTemporaryNotice(channel, content, ttlMs = ESCROW_TEMP_MESSAGE_TTL_MS) {
+
+    if (!channel?.isTextBased?.()) return null;
+
+    await cleanupEscrowTemporaryNoticesInChannel(channel, ttlMs);
+
+    const sentMessage = await channel.send({ content }).catch(() => null);
+
+    if (!sentMessage) return null;
+
+    setTimeout(async () => {
+        try {
+            await sentMessage.delete().catch(() => null);
+        } catch {
+            // ignore temporary message delete failures
+        }
+    }, ttlMs);
+
+    return sentMessage;
+}
+
+async function cleanupEscrowTemporaryNoticesAtStartup() {
+
+    // 이전에는 일부 설정 채널들만 검사했으나, 봇이 메시지를 보낼 수 있는 모든 길드의
+    // 텍스트 채널을 순회하여 남아있는 임시 인증 메시지를 정리하도록 변경합니다.
+
+    // 먼저 기존에 명시된 채널들도 함께 처리 (안전망)
+    const targetChannelIds = new Set([TARGET_ESCROW_CHANNEL_ID, ESCROW_DEFAULT_SUCCESS_CHANNEL_ID]);
+
+    for (const [, guildConfig] of guildSettingsMap.entries()) {
+        if (guildConfig?.escrowPanelChannelId) targetChannelIds.add(guildConfig.escrowPanelChannelId);
+        if (guildConfig?.escrowLogChannelId) targetChannelIds.add(guildConfig.escrowLogChannelId);
+    }
+
+    // 정적으로 지정된 채널들 먼저 정리
+    for (const channelId of targetChannelIds) {
+        const channel = await client.channels.fetch(channelId).catch(() => null);
+        if (!channel?.isTextBased?.()) continue;
+        await cleanupEscrowTemporaryNoticesInChannel(channel, ESCROW_TEMP_MESSAGE_TTL_MS);
+    }
+
+    // 이제 봇이 속한 모든 길드의 텍스트 채널을 순회하여 임시 메시지를 정리
+    for (const guild of client.guilds.cache.values()) {
+        // 채널 정보를 최신으로 가져오려 시도
+        try {
+            await guild.channels.fetch();
+        } catch (e) {
+            // 채널 목록을 가져오지 못하면 그 길드는 건너뜁니다
+            continue;
+        }
+
+        for (const channel of guild.channels.cache.values()) {
+            if (!channel?.isTextBased?.() || typeof channel.messages?.fetch !== 'function') continue;
+
+            await cleanupEscrowTemporaryNoticesInChannel(channel, ESCROW_TEMP_MESSAGE_TTL_MS).catch(() => null);
+        }
+    }
+}
+
+function startEscrowTemporaryNoticeSweeper() {
+
+    if (escrowNoticeSweeperTimer) return;
+
+    escrowNoticeSweeperTimer = setInterval(() => {
+        cleanupEscrowTemporaryNoticesAtStartup().catch(error => {
+            console.error('임시 인증 알림 정리 실패:', error);
+        });
+    }, ESCROW_NOTICE_SWEEP_INTERVAL_MS);
+}
+
 function findEscrowEntryByCode(code) {
 
     for (const [userId, entry] of escrowCodeMap.entries()) {
@@ -273,8 +451,9 @@ function findEscrowEntryByCode(code) {
 
 async function connectEscrowMailbox() {
 
-    const user = process.env.SMTP_USER;
-    const pass = process.env.SMTP_PASS;
+    // Support multiple common env names for IMAP credentials
+    const user = process.env.SMTP_USER ?? process.env.IMAP_USER ?? process.env.ESCROW_IMAP_USER;
+    const pass = process.env.SMTP_PASS ?? process.env.IMAP_PASS ?? process.env.ESCROW_IMAP_PASS;
 
     if (!user || !pass) {
         console.warn('메일 수신용 SMTP 사용자/비밀번호가 설정되어 있지 않습니다.');
@@ -309,6 +488,12 @@ async function connectEscrowMailbox() {
 
 async function processEscrowMailMessage(rawMessage) {
 
+    const messageKey = `${rawMessage.mailboxName ?? 'unknown'}:${rawMessage.uid ?? 'no-uid'}`;
+
+    if (!markMailAsProcessed(messageKey)) {
+        return;
+    }
+
     const parsed = await simpleParser(rawMessage.source);
     const searchableText = collectMailSearchText(parsed);
     const code = extractSixDigitCode(searchableText);
@@ -332,24 +517,26 @@ async function processEscrowMailMessage(rawMessage) {
 
     if (!member) return;
 
+    const guildConfig = getGuildConfig(guild.id);
+    const notificationChannel = await resolveEscrowLogChannel(guild).catch(() => null);
+
     // 전화번호 형식 발신자만 인증 처리
     if (!isPhoneNumberSender(senderAddress)) {
         console.log('아이디 형식 발신자, 거절:', senderAddress);
 
-        // 사용자에게 SMS로 보내달라고 알림 (1분 후 삭제)
+        // 같은 사용자/인증코드에 대해 일정 시간 동안 SMS 안내 멘션을 1회만 전송
+        if (!shouldSendEscrowSmsNotice(pending.userId, code)) {
+            return;
+        }
+
+        // 사용자에게 SMS로 보내달라고 알림 (30초 후 삭제)
         try {
-            const notifyChannel = await client.channels.fetch(TARGET_ESCROW_CHANNEL_ID).catch(() => null);
+            const notifyChannel = pending?.channelId
+                ? await client.channels.fetch(pending.channelId).catch(() => null)
+                : (guildConfig?.escrowPanelChannelId ? await client.channels.fetch(guildConfig.escrowPanelChannelId).catch(() => null) : null);
 
             if (notifyChannel?.isTextBased?.()) {
-                const tempMsg = await notifyChannel.send({ content: `<@${member.id}>님 SMS 문자로 보내주세요.` });
-
-                setTimeout(async () => {
-                    try {
-                        await tempMsg.delete().catch(() => null);
-                    } catch (e) {
-                        // ignore
-                    }
-                }, 60 * 1000);
+                await sendEscrowTemporaryNotice(notifyChannel, `<@${member.id}>님 SMS 문자로 보내주세요.`);
             }
         } catch (e) {
             console.error('거절 알림 전송 실패:', e);
@@ -360,91 +547,82 @@ async function processEscrowMailMessage(rawMessage) {
 
     const roleObj = await ensureEscrowVerifiedRole(guild);
 
-    await member.roles.add(roleObj.id).catch(error => {
+    // Debug logging: show which pending entry we're processing
+    try {
+        console.log('인증 처리중:', { code, userId: pending.userId, guildId: pending.guildId, channelId: pending.channelId });
+    } catch {}
+
+    // Check bot role position vs target role to avoid silent failures
+    try {
+        const botMember = await guild.members.fetch(client.user.id).catch(() => null);
+
+        if (botMember && roleObj && botMember.roles.highest && typeof botMember.roles.highest.position === 'number') {
+            if (botMember.roles.highest.position <= roleObj.position) {
+                console.error('봇의 역할이 거래인증 역할보다 낮아 역할 부여 불가');
+
+                try {
+                    const adminNotice = notificationChannel?.isTextBased?.() ? notificationChannel : (pending.channelId ? await client.channels.fetch(pending.channelId).catch(() => null) : null);
+
+                    if (adminNotice?.isTextBased?.()) {
+                        await adminNotice.send({ content: `⚠️ 인증 처리 실패: 봇 권한 문제로 <@${member.id}> 님에게 거래인증 역할을 부여할 수 없습니다. 봇의 역할을 '거래인증' 역할 위로 올려주세요.` }).catch(() => null);
+                    }
+                } catch (e) {
+                    console.error('권한 경고 전송 실패:', e);
+                }
+
+                return;
+            }
+        }
+    } catch (e) {
+        console.error('봇 역할 포지션 체크 실패:', e);
+    }
+
+    try {
+        await member.roles.add(roleObj.id);
+        console.log(`거래인증 역할 부여 성공: ${member.id} -> ${roleObj.id}`);
+    } catch (error) {
         console.error('거래인증 역할 부여 실패:', error);
-    });
+
+        try {
+            const errChannel = pending.channelId ? await client.channels.fetch(pending.channelId).catch(() => null) : null;
+
+            if (errChannel?.isTextBased?.()) {
+                await errChannel.send({ content: `<@${member.id}> 인증 처리 중 오류가 발생했습니다. 관리자에게 문의해주세요.` }).catch(() => null);
+            }
+        } catch (e) {
+            console.error('오류 알림 전송 실패:', e);
+        }
+    }
 
     escrowPendingMessageMap.delete(pending.userId);
     escrowCodeMap.delete(pending.userId);
     await saveEscrowCodes();
 
-    const completionMessage = `${hasInputPhrase ? '완료되었습니다\n' : ''}인증이 완료되었습니다.`;
-    const guildConfig = pending.guildId ? getGuildConfig(pending.guildId) : null;
-    const notificationChannelId = guildConfig?.escrowLogChannelId ?? ESCROW_DEFAULT_SUCCESS_CHANNEL_ID;
-    const notificationChannel = await client.channels.fetch(notificationChannelId).catch(() => null);
+    const completionMessage = `<@${member.id}> 인증되었습니다.`;
 
-    // If the original request was NOT from the designated public channel, send a masked admin log and stop.
-    if (pending.channelId !== TARGET_ESCROW_CHANNEL_ID) {
-        try {
-            if (notificationChannel?.isTextBased?.()) {
-                const masked = '발신자: 01023181764 <발신전용> 01023181764@mms.kt.co.kr';
-                const maskedMessage = buildEscrowLogContent(masked, code, hasInputPhrase, member);
-                await notificationChannel.send({ content: maskedMessage }).catch(error => {
-                    console.error('마스킹된 성공 채널 전송 실패:', error);
-                });
-            }
-        } catch (e) {
-            console.error('마스킹된 관리자 로그 전송 실패:', e);
-        }
-
-        // notify the original channel a short completion message (optional) and return
-        try {
-            const sourceChannel = pending.channelId ? await client.channels.fetch(pending.channelId).catch(() => null) : null;
-
-            if (sourceChannel?.isTextBased?.()) {
-                await sourceChannel.send({ content: completionMessage }).catch(() => null);
-            }
-        } catch (e) {
-            // ignore
-        }
-
-        return;
-    }
-
-    // 정상 경로: 공개 인증 채널에서 온 요청만 여기서 처리
     const notificationMessage = buildEscrowLogContent(senderLabel, code, hasInputPhrase, member);
 
     if (notificationChannel?.isTextBased?.()) {
         await notificationChannel.send({ content: notificationMessage }).catch(error => {
-            console.error('성공 채널 전송 실패:', error);
+            console.error('인증로그 채널 전송 실패:', error);
         });
     } else {
-        console.warn(`성공 채널을 찾지 못했거나 전송할 수 없습니다: ${notificationChannelId}`);
-        const fallbackChannel = pending.channelId ? await client.channels.fetch(pending.channelId).catch(() => null) : null;
-
-        if (fallbackChannel?.isTextBased?.()) {
-            await fallbackChannel.send({ content: completionMessage }).catch(error => {
-                console.error('대체 채널 전송 실패:', error);
-            });
-        }
+        console.warn(`인증로그 채널을 찾지 못했거나 전송할 수 없습니다: ${guild.id}`);
     }
 
-    // 요청: 고정 채널(TARGET_ESCROW_CHANNEL_ID)에 짧은 알림을 보낸 뒤 1분 후 삭제
-    try {
-        const notifyChannel = await client.channels.fetch(TARGET_ESCROW_CHANNEL_ID).catch(() => null);
+    const tempNoticeChannelIds = new Set(
+        [pending.channelId, guildConfig?.escrowPanelChannelId].filter(Boolean)
+    );
 
-        if (notifyChannel?.isTextBased?.()) {
-            const tempMsg = await notifyChannel.send({ content: `<@${member.id}> 인증되었습니다` });
+    for (const channelId of tempNoticeChannelIds) {
+        const tempChannel = await client.channels.fetch(channelId).catch(() => null);
 
-            setTimeout(async () => {
-                try {
-                    await tempMsg.delete().catch(() => null);
-                } catch (e) {
-                    // ignore
-                }
-            }, 60 * 1000);
-        }
-    } catch (e) {
-        console.error('인증 알림 전송 실패:', e);
-    }
+        if (!tempChannel?.isTextBased?.()) continue;
 
-    if (pending.channelId && notificationChannel?.id !== pending.channelId) {
-        const sourceChannel = await client.channels.fetch(pending.channelId).catch(() => null);
-
-        if (sourceChannel?.isTextBased?.()) {
-            await sourceChannel.send({ content: completionMessage }).catch(error => {
-                console.error('원본 채널 완료 알림 실패:', error);
-            });
+        try {
+            await sendEscrowTemporaryNotice(tempChannel, completionMessage);
+        } catch (error) {
+            console.error('임시 완료 알림 전송 실패:', error);
         }
     }
 }
@@ -476,7 +654,7 @@ async function pollEscrowMailbox() {
                 escrowMailboxStateMap.set(mailboxName, mailboxState);
 
                 try {
-                    await processEscrowMailMessage(message);
+                    await processEscrowMailMessage({ ...message, mailboxName });
                 } catch (error) {
                     console.error('인증 메일 처리 실패:', error);
                 }
@@ -1306,7 +1484,7 @@ const SETTING_COMMAND = new SlashCommandBuilder()
 const WISHLIST_PANEL_COMMAND = new SlashCommandBuilder()
     .setName('wishlist_panel')
     .setNameLocalizations({
-        ko: '위시패널'
+        ko: '위시리스트'
     })
     .setDescription('Create a wishlist panel message in this channel')
     .setDescriptionLocalizations({
@@ -1574,20 +1752,10 @@ client.once(Events.ClientReady, async () => {
     await loadGuildSettings();
     await loadEscrowConfig();
     await loadEscrowCodes();
-    await attachEscrowButtonToTargetMessage();
+    await cleanupEscrowTemporaryNoticesAtStartup();
+    startEscrowTemporaryNoticeSweeper();
+    // 자동으로 패널을 게시하지 않습니다. 필요한 경우 /인증 또는 /위시리스트 명령어로 게시하세요.
     await startEscrowMailboxWatcher();
-
-    if (WISHLIST_CHANNEL) {
-        try {
-            const channel = await client.channels.fetch(WISHLIST_CHANNEL);
-
-            if (channel?.isTextBased()) {
-                await channel.send(buildWishlistPanelMessage());
-            }
-        } catch (e) {
-            console.error('위시리스트 채널 초기 메시지 전송 실패:', e);
-        }
-    }
 
     try {
         if (client.application) {
@@ -1913,15 +2081,7 @@ client.on(Events.InteractionCreate, async interaction => {
                     const errorChannel = await client.channels.fetch(TARGET_ESCROW_CHANNEL_ID).catch(() => null);
 
                     if (errorChannel?.isTextBased?.()) {
-                        const tempMsg = await errorChannel.send({ content: `<@${interaction.user.id}> 잘못입력했습니다` });
-
-                        setTimeout(async () => {
-                            try {
-                                await tempMsg.delete().catch(() => null);
-                            } catch (e) {
-                                // ignore
-                            }
-                        }, 60 * 1000);
+                        await sendEscrowTemporaryNotice(errorChannel, `<@${interaction.user.id}> 인증코드가 일치하지 않습니다.`);
                     }
                 } catch (e) {
                     console.error('오류 알림 전송 실패:', e);
