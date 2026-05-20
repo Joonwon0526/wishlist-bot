@@ -223,6 +223,33 @@ async function resolveEscrowLogChannel(guild) {
     return createdChannel;
 }
 
+async function resolveEscrowPanelChannel(guild) {
+
+    const guildConfig = getGuildConfig(guild.id);
+    const configuredChannelId = guildConfig?.escrowPanelChannelId ?? null;
+    const configuredChannel = configuredChannelId
+        ? await client.channels.fetch(configuredChannelId).catch(() => null)
+        : null;
+
+    if (configuredChannel?.isTextBased?.() && configuredChannel.guild?.id === guild.id) {
+        return configuredChannel;
+    }
+
+    const createdChannel = await ensureEscrowChannel(
+        guild,
+        ESCROW_PANEL_CHANNEL_NAME,
+        '인증 패널 자동 세팅 채널 생성'
+    );
+
+    guildSettingsMap.set(guild.id, {
+        ...guildConfig,
+        escrowPanelChannelId: createdChannel.id
+    });
+    await saveGuildSettings();
+
+    return createdChannel;
+}
+
 function buildEscrowLogContent(senderLabel, code, hasInputPhrase, member) {
 
     const lines = [
@@ -531,9 +558,14 @@ async function processEscrowMailMessage(rawMessage) {
 
         // 사용자에게 SMS로 보내달라고 알림 (30초 후 삭제)
         try {
-            const notifyChannel = pending?.channelId
+            let notifyChannel = pending?.channelId
                 ? await client.channels.fetch(pending.channelId).catch(() => null)
-                : (guildConfig?.escrowPanelChannelId ? await client.channels.fetch(guildConfig.escrowPanelChannelId).catch(() => null) : null);
+                : null;
+
+            if (!notifyChannel) {
+                const panelChannel = await resolveEscrowPanelChannel(guild).catch(() => null);
+                notifyChannel = panelChannel;
+            }
 
             if (notifyChannel?.isTextBased?.()) {
                 await sendEscrowTemporaryNotice(notifyChannel, `<@${member.id}>님 SMS 문자로 보내주세요.`);
@@ -610,8 +642,11 @@ async function processEscrowMailMessage(rawMessage) {
         console.warn(`인증로그 채널을 찾지 못했거나 전송할 수 없습니다: ${guild.id}`);
     }
 
+    // escrowPanelChannelId가 설정되지 않았으면 자동으로 생성
+    const panelChannel = await resolveEscrowPanelChannel(guild).catch(() => null);
+    
     const tempNoticeChannelIds = new Set(
-        [pending.channelId, guildConfig?.escrowPanelChannelId].filter(Boolean)
+        [pending.channelId, panelChannel?.id].filter(Boolean)
     );
 
     for (const channelId of tempNoticeChannelIds) {
