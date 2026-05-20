@@ -1074,17 +1074,27 @@ function buildEscrowStartButtonRow() {
 async function buildEscrowPanelEmbeds() {
 
     const description = [
-        '휴대폰 SMS 문자 메시지에 [hwanzixwan@gmail.com]을 입력한 뒤, 전송되는 6자리 인증코드를 입력해주세요.',
-        '',
+        '안전거래 혜택',
+        '- 중개 2회 무료 (간편한 중개 서비스 이용 가능)',
+        '- 거래 신뢰도 상승 및 판매 속도 증가 가능',
         '- 신용인 포스트 이용 가능',
-        '- 보다 간편한 중개 서비스 이용 가능',
-        '- 필수는 아닙니다. 다만 신용인 인증을 이용하시려면 해당 절차를 진행하셔야 합니다.'
+        '- @신용인 역할 지급',
+        '',
+        '수집되는 정보',
+        '- 관리자에게 전화번호가 수집 됨',
+        '- 디스코드 숫자ID (사용자 이름)',
+        '',
+        '수집된 정보는 오직 관리자 @최준원 , @파더 만 확인 가능하며, 안전거래 및 사기 방지 목적 외에는 사용되지 않습니다.',
+        '정상적인 거래 이용 시 개인정보가 외부로 유출될 일은 없습니다.',
+        '',
+        '추천 대상',
+        '- 신뢰도를 쌓고 싶은 판매자 / 구매자'
     ].join('\n');
 
     const embeds = [
         new EmbedBuilder()
             .setColor(0x2B2D31)
-            .setTitle('신용인 인증')
+            .setTitle('안전거래')
             .setDescription(description)
     ];
 
