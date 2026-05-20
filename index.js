@@ -21,6 +21,7 @@ const {
 } = require('discord.js');
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
+const nodemailer = require('nodemailer');
 
 const client = new Client({
     intents: [
@@ -45,13 +46,14 @@ const ESCROW_PANEL_IMAGE_SOURCES = [
 ].filter(Boolean);
 const ESCROW_IMAP_HOST = 'imap.gmail.com';
 const ESCROW_IMAP_PORT = 993;
-const ESCROW_POLL_INTERVAL_MS = 5000;
+const ESCROW_POLL_INTERVAL_MS = 30000; // 30초 폴링 간격으로 완화
 const ESCROW_MAILBOX_CANDIDATES = [
     'INBOX',
     '[Gmail]/Spam',
     '[Google Mail]/Spam',
     'Spam'
 ];
+const ESCROW_FETCH_MAX_MESSAGES_PER_POLL = 5; // 폴링당 최대 처리 메시지 수
 const ESCROW_DEFAULT_SUCCESS_CHANNEL_ID = '1502713125827510445';
 const ESCROW_PANEL_CHANNEL_NAME = '인증';
 const ESCROW_LOG_CHANNEL_NAME = '인증로그';
@@ -77,6 +79,84 @@ const ESCROW_IMAP_MAX_CONSECUTIVE_ERRORS = 10; // 최대 연속 에러 횟수
 const ESCROW_IMAP_BASE_BACKOFF_MS = 30000; // 기본 백오프 30초
 const ESCROW_IMAP_MAX_BACKOFF_MS = 600000; // 최대 백오프 10분
 const ESCROW_FAILED_MAILBOX_TTL_MS = 3600000; // 실패한 메일함 캐시 1시간
+const escrowSmsAttemptsMap = new Map(); // userId -> { attempts: 0, code: '123456', guildId, channelId, memberId }
+const ESCROW_SMS_MAX_ATTEMPTS = 3; // SMS 인증 최대 시도 횟수
+
+// SMTP 이메일 발송기 설정 (SMS 게이트웨이용)
+const smtpTransporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST || 'smtp.gmail.com',
+    port: parseInt(process.env.SMTP_PORT || '587'),
+    secure: false,
+    auth: {
+        user: process.env.SMTP_USER,
+        pass: process.env.SMTP_PASS
+    }
+});
+
+// ===== SMTP send rate limiting / safe sender =====
+const EMAIL_RATE_LIMIT_PER_MIN = parseInt(process.env.SMTP_RATE_PER_MIN || '20'); // 기본 분당 20건
+let emailTokens = EMAIL_RATE_LIMIT_PER_MIN;
+const emailQueue = [];
+let emailProcessing = false;
+
+// 매 분 토큰 리필
+setInterval(() => {
+    emailTokens = EMAIL_RATE_LIMIT_PER_MIN;
+    // 트래픽이 완화될 때 큐 처리 재시도
+    processEmailQueue().catch(() => null);
+}, 60 * 1000);
+
+async function processEmailQueue() {
+    if (emailProcessing) return;
+    emailProcessing = true;
+
+    while (emailQueue.length && emailTokens > 0) {
+        const item = emailQueue.shift();
+        try {
+            await smtpTransporter.sendMail(item.mailOptions);
+            emailTokens--;
+            item.resolve();
+        } catch (err) {
+            item.reject(err);
+        }
+    }
+
+    emailProcessing = false;
+}
+
+function enqueueSendMail(mailOptions) {
+    return new Promise((resolve, reject) => {
+        emailQueue.push({ mailOptions, resolve, reject });
+        // 즉시 처리 시도
+        processEmailQueue().catch(() => null);
+    });
+}
+
+async function safeSendMail(mailOptions) {
+    if (!process.env.SMTP_USER || !process.env.SMTP_PASS) {
+        console.warn('SMTP not configured - skipping sendMail');
+        return Promise.resolve();
+    }
+
+    // 즉시 토큰이 있으면 바로 시도
+    if (emailTokens > 0) {
+        try {
+            await smtpTransporter.sendMail(mailOptions);
+            emailTokens--;
+            return;
+        } catch (err) {
+            // 실패하면 큐에 넣어 재시도
+            console.warn('Immediate send failed, enqueueing:', err?.message ?? err);
+            return enqueueSendMail(mailOptions);
+        }
+    }
+
+    // 토큰 없으면 큐에 보관
+    return enqueueSendMail(mailOptions);
+}
+
+// 편의상 transporter에 붙여서 기존 코드가 사용할 수 있게 함
+smtpTransporter.safeSendMail = safeSendMail;
 
 let redisClient = null;
 
@@ -567,12 +647,16 @@ async function processEscrowMailMessage(rawMessage) {
     if (!isPhoneNumberSender(senderAddress)) {
         console.log('아이디 형식 발신자, 거절:', senderAddress);
 
-        // 같은 사용자/인증코드에 대해 일정 시간 동안 SMS 안내 멘션을 1회만 전송
-        if (!shouldSendEscrowSmsNotice(pending.userId, code)) {
-            return;
-        }
+        // SMS 인증 정보 저장 (매번 업데이트)
+        escrowSmsAttemptsMap.set(pending.userId, {
+            attempts: 0,
+            code: code,
+            guildId: guild.id,
+            channelId: pending.channelId,
+            memberId: member.id
+        });
 
-        // 사용자에게 SMS로 보내달라고 알림 (30초 후 삭제)
+        // 사용자에게 SMS 인증 안내 + 인증완료 버튼
         try {
             let notifyChannel = pending?.channelId
                 ? await client.channels.fetch(pending.channelId).catch(() => null)
@@ -584,7 +668,24 @@ async function processEscrowMailMessage(rawMessage) {
             }
 
             if (notifyChannel?.isTextBased?.()) {
-                await sendEscrowTemporaryNotice(notifyChannel, `<@${member.id}>님 SMS 문자로 보내주세요.`);
+                const recipientEmail = getEscrowRecipientEmail(guild.id);
+                const smsMessage = `SMS 문자 메시지로 아래 인증코드를 [${recipientEmail}] 으로 보내주시면 됩니다.\n\n인증코드 : [ ${code} ]`;
+                
+                const verifyButton = new ButtonBuilder()
+                    .setCustomId(`escrow_sms_verify:${pending.userId}`)
+                    .setLabel('인증 완료')
+                    .setStyle(ButtonStyle.Success);
+
+                const row = new ActionRowBuilder().addComponents(verifyButton);
+
+                // 일반 메시지로 전송 (ephemeral은 버튼이 제대로 작동 안 함)
+                await notifyChannel.send({
+                    content: `<@${member.id}> ${smsMessage}`,
+                    components: [row]
+                }).then(msg => {
+                    // 30초 후 자동 삭제
+                    setTimeout(() => msg.delete().catch(() => null), 30000);
+                }).catch(err => console.error('SMS 인증 메시지 전송 실패:', err));
             }
         } catch (e) {
             console.error('거절 알림 전송 실패:', e);
@@ -745,6 +846,7 @@ async function pollEscrowMailbox() {
             const startUid = mailboxState.lastUid + 1;
 
             try {
+                let processedCount = 0;
                 for await (const message of imapClient.fetch(`${startUid}:*`, { uid: true, source: true })) {
                     mailboxState.lastUid = Math.max(mailboxState.lastUid, message.uid ?? mailboxState.lastUid);
                     escrowMailboxStateMap.set(mailboxName, mailboxState);
@@ -753,6 +855,12 @@ async function pollEscrowMailbox() {
                         await processEscrowMailMessage({ ...message, mailboxName });
                     } catch (error) {
                         console.error('인증 메일 처리 실패:', error);
+                    }
+
+                    processedCount++;
+                    if (processedCount >= ESCROW_FETCH_MAX_MESSAGES_PER_POLL) {
+                        // 너무 많은 메시지를 한 번에 처리하지 않도록 제한
+                        break;
                     }
                 }
             } catch (fetchError) {
@@ -1999,9 +2107,118 @@ client.on(Events.InteractionCreate, async interaction => {
                 channelId: interaction.channelId
             });
 
+            // SMS 인증 버튼 추가
+            const verifyButton = new ButtonBuilder()
+                .setCustomId(`escrow_sms_verify:${interaction.user.id}`)
+                .setLabel('인증 완료')
+                .setStyle(ButtonStyle.Success);
+
+            const row = new ActionRowBuilder().addComponents(verifyButton);
+
+            const recipientEmail = getEscrowRecipientEmail(guild.id);
+
             await interaction.editReply({
-                content: `SMS 문자 메시지로 아래 인증코드를 [${DEFAULT_ESCROW_EMAIL}] 으로 보내주시면 됩니다.\n\n## 인증코드 : [ ${code} ]\n\n-# 해당 인증코드는 5분 동안 유효합니다.`
+                content: `SMS 문자 메시지로 아래 인증코드를 [${recipientEmail}] 으로 보내주시면 됩니다.\n\n## 인증코드 : [ ${code} ]\n\n인증번호를 입력하고 [인증 완료] 버튼을 눌러주세요.\n\n-# 해당 인증코드는 5분 동안 유효합니다.`,
+                components: [row]
             });
+            return;
+        }
+
+        // SMS 인증 완료 버튼
+        if (interaction.customId.startsWith('escrow_sms_verify:')) {
+            const userId = interaction.customId.split(':')[1];
+            
+            // 본인만 인증 가능
+            if (interaction.user.id !== userId) {
+                await replyEphemeral(interaction, {
+                    content: '본인의 인증만 진행할 수 있습니다.'
+                });
+                return;
+            }
+
+            await deferEphemeralReply(interaction);
+
+            let smsData = escrowSmsAttemptsMap.get(userId);
+
+            if (!smsData) {
+                await pollEscrowMailbox();
+                smsData = escrowSmsAttemptsMap.get(userId);
+            }
+
+            if (!smsData) {
+                const guild = interaction.guild ?? await client.guilds.fetch(interaction.guildId).catch(() => null);
+                const member = guild ? await guild.members.fetch(userId).catch(() => null) : null;
+                const roleObj = guild ? await ensureEscrowVerifiedRole(guild).catch(() => null) : null;
+
+                if (guild && member && roleObj && member.roles.cache.has(roleObj.id)) {
+                    await interaction.editReply({
+                        content: '✅ 인증이 완료되었습니다.'
+                    });
+                    return;
+                }
+
+                // 같은 인증코드에 대해 반복 안내를 방지
+                const stored = escrowCodeMap.get(userId);
+                const storedCode = stored?.code ?? null;
+
+                if (!shouldSendEscrowSmsNotice(userId, storedCode)) {
+                    await interaction.editReply({
+                        content: '이미 안내를 보냈습니다. 메일이 도착한 뒤 다시 눌러주세요.'
+                    });
+                    return;
+                }
+
+                await interaction.editReply({
+                    content: '인증번호를 입력하고 [인증 완료] 버튼을 눌러주세요.'
+                });
+                return;
+            }
+
+            const guild = await client.guilds.fetch(smsData.guildId).catch(() => null);
+            const member = guild ? await guild.members.fetch(smsData.memberId).catch(() => null) : null;
+
+            if (!guild || !member) {
+                await interaction.editReply({
+                    content: '❌ 인증 정보를 찾을 수 없습니다. 관리자에게 문의해주세요.'
+                });
+                return;
+            }
+
+            try {
+                const roleObj = await ensureEscrowVerifiedRole(guild);
+                const botMember = await guild.members.fetch(client.user.id).catch(() => null);
+
+                if (botMember && roleObj && botMember.roles.highest.position <= roleObj.position) {
+                    await interaction.editReply({
+                        content: '❌ 봇의 권한이 부족합니다. 관리자에게 문의해주세요.'
+                    });
+                    return;
+                }
+
+                await member.roles.add(roleObj.id);
+                console.log(`✅ SMS 인증 역할 부여 성공: ${smsData.memberId} -> ${roleObj.id}`);
+
+                const logChannel = await resolveEscrowLogChannel(guild).catch(() => null);
+                if (logChannel?.isTextBased?.()) {
+                    await logChannel.send({
+                        content: `✅ **SMS 인증 완료**\n<@${smsData.memberId}> 님이 인증 완료 버튼을 눌렀습니다.`
+                    }).catch(() => null);
+                }
+
+                escrowSmsAttemptsMap.delete(userId);
+                escrowPendingMessageMap.delete(userId);
+                escrowCodeMap.delete(userId);
+                await saveEscrowCodes();
+
+                await interaction.editReply({
+                    content: '✅ 인증이 완료되었습니다!'
+                });
+            } catch (error) {
+                console.error('SMS 인증 역할 부여 실패:', error);
+                await interaction.editReply({
+                    content: '❌ 인증 처리 중 오류가 발생했습니다. 관리자에게 문의해주세요.'
+                });
+            }
             return;
         }
 
@@ -2119,6 +2336,93 @@ client.on(Events.InteractionCreate, async interaction => {
             content: '중개 안내를 전송했습니다.'
         });
 
+        return;
+    }
+
+    // SMS 인증코드 제출 핸들러
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('escrow_sms_submit:')) {
+        const userId = interaction.customId.split(':')[1];
+        const smsData = escrowSmsAttemptsMap.get(userId);
+
+        if (!smsData) {
+            await replyEphemeral(interaction, {
+                content: '인증 정보를 찾지 못했습니다. 다시 시도해 주세요.'
+            });
+            return;
+        }
+
+        // 본인만 인증 가능
+        if (interaction.user.id !== userId) {
+            await replyEphemeral(interaction, {
+                content: '본인의 인증만 진행할 수 있습니다.'
+            });
+            return;
+        }
+
+        // 시도 횟수 증가
+        smsData.attempts++;
+
+        const enteredCode = interaction.fields.getTextInputValue('sms_code')?.trim();
+        const maxAttempts = ESCROW_SMS_MAX_ATTEMPTS;
+
+        if (enteredCode === smsData.code) {
+            // ✅ 인증 성공 - 직접 역할 부여
+            const guild = await client.guilds.fetch(smsData.guildId).catch(() => null);
+            const member = guild ? await guild.members.fetch(smsData.memberId).catch(() => null) : null;
+
+            if (guild && member) {
+                try {
+                    const roleObj = await ensureEscrowVerifiedRole(guild);
+                    const botMember = await guild.members.fetch(client.user.id).catch(() => null);
+
+                    if (botMember && roleObj && botMember.roles.highest.position > roleObj.position) {
+                        await member.roles.add(roleObj.id);
+                        console.log(`✅ SMS 인증 역할 부여 성공: ${smsData.memberId} -> ${roleObj.id}`);
+
+                        // 인증로그 채널에 기록
+                        const logChannel = await resolveEscrowLogChannel(guild).catch(() => null);
+                        if (logChannel?.isTextBased?.()) {
+                            await logChannel.send({
+                                content: `✅ **SMS 인증 완료**\n<@${smsData.memberId}> 님이 SMS 인증을 완료했습니다.`
+                            }).catch(() => null);
+                        }
+
+                        await replyEphemeral(interaction, {
+                            content: '✅ 인증이 완료되었습니다!'
+                        });
+
+                        // 인증 정보 정리
+                        escrowSmsAttemptsMap.delete(userId);
+                    } else {
+                        await replyEphemeral(interaction, {
+                            content: '❌ 봇의 권한이 부족합니다. 관리자에게 문의해주세요.'
+                        });
+                    }
+                } catch (error) {
+                    console.error('SMS 인증 역할 부여 실패:', error);
+                    await replyEphemeral(interaction, {
+                        content: '❌ 인증 처리 중 오류가 발생했습니다. 관리자에게 문의해주세요.'
+                    });
+                }
+            } else {
+                await replyEphemeral(interaction, {
+                    content: '❌ 인증 정보를 찾을 수 없습니다. 관리자에게 문의해주세요.'
+                });
+            }
+        } else {
+            // ❌ 인증 실패
+            if (smsData.attempts >= maxAttempts) {
+                escrowSmsAttemptsMap.delete(userId);
+                await replyEphemeral(interaction, {
+                    content: `❌ 인증번호가 일치하지 않습니다. (${smsData.attempts}/${maxAttempts})\n\n최대 시도 횟수를 초과했습니다. 관리자에게 문의해주세요.`
+                });
+            } else {
+                const remaining = maxAttempts - smsData.attempts;
+                await replyEphemeral(interaction, {
+                    content: `❌ 인증번호가 일치하지 않습니다. (${smsData.attempts}/${maxAttempts})\n\n남은 시도: ${remaining}회`
+                });
+            }
+        }
         return;
     }
 

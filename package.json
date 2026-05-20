@@ -5,7 +5,9 @@
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "start:fg": "node -r dotenv/config index.js",
+    "start:keep": "bash run-keepalive.sh"
   },
   "dependencies": {
     "discord.js": "^14.26.4",
