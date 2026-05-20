@@ -69,6 +69,14 @@ let escrowNoticeSweeperTimer = null;
 const escrowMailboxStateMap = new Map();
 const escrowButtonCooldownMap = new Map(); // userId -> lastPressedAt
 const escrowProcessedMailMap = new Map(); // messageKey -> processedAt
+let escrowImapConsecutiveErrorCount = 0; // 연속 에러 카운트
+let escrowImapLastErrorTime = 0; // 마지막 에러 시각
+let escrowImapBackoffMultiplier = 1; // 백오프 승수
+const escrowFailedMailboxesMap = new Map(); // mailboxName -> lastFailedTime (존재하지 않는 메일함 캐시)
+const ESCROW_IMAP_MAX_CONSECUTIVE_ERRORS = 10; // 최대 연속 에러 횟수
+const ESCROW_IMAP_BASE_BACKOFF_MS = 30000; // 기본 백오프 30초
+const ESCROW_IMAP_MAX_BACKOFF_MS = 600000; // 최대 백오프 10분
+const ESCROW_FAILED_MAILBOX_TTL_MS = 3600000; // 실패한 메일함 캐시 1시간
 
 let redisClient = null;
 
@@ -498,9 +506,17 @@ async function connectEscrowMailbox() {
 
     try {
         await escrowImapClient.connect();
+        console.log('[인증] IMAP 연결 성공');
         return escrowImapClient;
     } catch (error) {
-        console.error('IMAP 연결 실패:', error);
+        const errorMsg = String(error?.message ?? error);
+        const isAuthError = errorMsg.includes('EAUTH') || errorMsg.includes('invalid') || errorMsg.includes('rejected');
+
+        if (isAuthError) {
+            console.error('❌ IMAP 인증 실패 - 자격증명 확인 필요:', errorMsg.split('\n')[0]);
+        } else {
+            console.warn('⚠️ IMAP 연결 임시 실패:', errorMsg.split('\n')[0]);
+        }
 
         try {
             await escrowImapClient.logout();
@@ -664,17 +680,61 @@ async function processEscrowMailMessage(rawMessage) {
 
 async function pollEscrowMailbox() {
 
+    const now = Date.now();
+
+    // 백오프 중인지 확인 (지수 백오프)
+    if (escrowImapConsecutiveErrorCount >= ESCROW_IMAP_MAX_CONSECUTIVE_ERRORS) {
+        const backoffTime = Math.min(
+            ESCROW_IMAP_BASE_BACKOFF_MS * escrowImapBackoffMultiplier,
+            ESCROW_IMAP_MAX_BACKOFF_MS
+        );
+        const timeSinceLastError = now - escrowImapLastErrorTime;
+
+        if (timeSinceLastError < backoffTime) {
+            console.warn(
+                `[인증] IMAP 폴링 백오프 중... (에러 ${escrowImapConsecutiveErrorCount}회, ` +
+                `${Math.ceil((backoffTime - timeSinceLastError) / 1000)}초 후 재시도)`
+            );
+            return;
+        }
+
+        // 백오프 완료 후 초기화
+        console.log('[인증] IMAP 백오프 완료, 폴링 재개');
+        escrowImapConsecutiveErrorCount = 0;
+        escrowImapBackoffMultiplier = 1;
+    }
+
     const imapClient = await connectEscrowMailbox();
 
-    if (!imapClient) return;
+    if (!imapClient) {
+        escrowImapConsecutiveErrorCount++;
+        escrowImapLastErrorTime = now;
+        if (escrowImapConsecutiveErrorCount < 5) escrowImapBackoffMultiplier = 1;
+        else if (escrowImapConsecutiveErrorCount < 8) escrowImapBackoffMultiplier = 2;
+        else escrowImapBackoffMultiplier = 4;
+        return;
+    }
 
     if (escrowImapPolling) return;
 
     escrowImapPolling = true;
 
     try {
+        let hasErrors = false;
+
         for (const mailboxName of ESCROW_MAILBOX_CANDIDATES) {
-            const mailbox = await imapClient.mailboxOpen(mailboxName).catch(() => null);
+            // 최근에 실패한 메일함이면 건너뛰기
+            const failedAt = escrowFailedMailboxesMap.get(mailboxName);
+            if (failedAt && (now - failedAt) < ESCROW_FAILED_MAILBOX_TTL_MS) {
+                continue;
+            }
+
+            const mailbox = await imapClient.mailboxOpen(mailboxName).catch((err) => {
+                console.warn(`메일함 접근 실패 (캐시 처리): ${mailboxName} - ${err?.message?.split('\n')[0]}`);
+                escrowFailedMailboxesMap.set(mailboxName, now);
+                hasErrors = true;
+                return null;
+            });
 
             if (!mailbox) continue;
 
@@ -684,19 +744,37 @@ async function pollEscrowMailbox() {
 
             const startUid = mailboxState.lastUid + 1;
 
-            for await (const message of imapClient.fetch(`${startUid}:*`, { uid: true, source: true })) {
-                mailboxState.lastUid = Math.max(mailboxState.lastUid, message.uid ?? mailboxState.lastUid);
-                escrowMailboxStateMap.set(mailboxName, mailboxState);
+            try {
+                for await (const message of imapClient.fetch(`${startUid}:*`, { uid: true, source: true })) {
+                    mailboxState.lastUid = Math.max(mailboxState.lastUid, message.uid ?? mailboxState.lastUid);
+                    escrowMailboxStateMap.set(mailboxName, mailboxState);
 
-                try {
-                    await processEscrowMailMessage({ ...message, mailboxName });
-                } catch (error) {
-                    console.error('인증 메일 처리 실패:', error);
+                    try {
+                        await processEscrowMailMessage({ ...message, mailboxName });
+                    } catch (error) {
+                        console.error('인증 메일 처리 실패:', error);
+                    }
                 }
+            } catch (fetchError) {
+                console.error(`메일함 FETCH 실패: ${mailboxName}`, fetchError?.message?.split('\n')[0]);
+                hasErrors = true;
             }
         }
+
+        // 에러가 없었으면 에러 카운트 리셋
+        if (!hasErrors && escrowImapConsecutiveErrorCount > 0) {
+            console.log('[인증] IMAP 폴링 정상 완료, 에러 카운트 초기화');
+            escrowImapConsecutiveErrorCount = 0;
+            escrowImapBackoffMultiplier = 1;
+        }
     } catch (error) {
-        console.error('인증 메일함 조회 실패:', error);
+        console.error('인증 메일함 조회 실패:', error?.message?.split('\n')[0]);
+        escrowImapConsecutiveErrorCount++;
+        escrowImapLastErrorTime = now;
+
+        if (escrowImapConsecutiveErrorCount < 5) escrowImapBackoffMultiplier = 1;
+        else if (escrowImapConsecutiveErrorCount < 8) escrowImapBackoffMultiplier = 2;
+        else escrowImapBackoffMultiplier = 4;
 
         try {
             await imapClient.logout();
@@ -1075,7 +1153,7 @@ async function buildEscrowPanelEmbeds() {
 
     const description = [
         '안전거래 혜택',
-        '- 중개 2회 무료 (간편한 중개 서비스 이용 가능)',
+
         '- 거래 신뢰도 상승 및 판매 속도 증가 가능',
         '- 신용인 포스트 이용 가능',
         '- @신용인 역할 지급',
